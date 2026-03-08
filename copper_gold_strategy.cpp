@@ -102,6 +102,30 @@ static FuturesSeries load_futures(const std::string& path) {
         } catch (...) { continue; }
         out[dk] = bar;
     }
+
+    // Data quality: detect and fix unit-change jumps (e.g., 6J 0.013 → 13065)
+    if (out.size() > 1) {
+        auto it = out.begin();
+        auto prev = it;
+        ++it;
+        for (; it != out.end(); ++it) {
+            double ratio = it->second.close / prev->second.close;
+            if (ratio > 5.0 || ratio < 0.2) {
+                double log_ratio = std::log10(std::abs(ratio));
+                int exponent = static_cast<int>(std::round(log_ratio));
+                double fix_factor = std::pow(10.0, -exponent);
+                std::cerr << "[DATA FIX] " << path << " date=" << date_from_int(it->first)
+                          << " price jump " << prev->second.close << " -> " << it->second.close
+                          << " (x" << ratio << "), applying fix factor " << fix_factor << "\n";
+                it->second.open  *= fix_factor;
+                it->second.high  *= fix_factor;
+                it->second.low   *= fix_factor;
+                it->second.close *= fix_factor;
+            }
+            prev = it;
+        }
+    }
+
     return out;
 }
 // Helper function to check if all positions are zero
@@ -577,7 +601,7 @@ public:
         std::vector<double> ratio(n, std::numeric_limits<double>::quiet_NaN());
         for (int i = 0; i < n; ++i) {
             if (!std::isnan(hg[i]) && !std::isnan(gc[i]) && gc[i] > 0.0) {
-                // Cu_notional = HG_price * 25000 / 100 (convert cents to dollars)
+                // Cu_notional = HG_price * 25000 (data already in $/lb)
                 // Au_notional = GC_price * 100
                 double cu_notional = hg[i] * 25000.0;
                 double au_notional = gc[i] * 100.0;
@@ -623,6 +647,7 @@ public:
         // Z-scores for liquidity
         auto vix_z60 = rolling_zscore(vix, p_.liq_zscore_window);
         auto hy_z60 = rolling_zscore(hy, p_.liq_zscore_window);
+        auto dxy_z60 = rolling_zscore(dxy, p_.liq_zscore_window);
 
         // Fed balance sheet YoY growth
         std::vector<double> fed_bs_yoy(n, std::numeric_limits<double>::quiet_NaN());
@@ -642,9 +667,13 @@ public:
         // China CLI 3-month average
         auto china_sma65 = rolling_mean(china_cli, 65);
 
-        // ATRs for volatility adjustment
-        auto gc_atr = compute_atr(dates, fut_["GC"], 20);
-        auto si_atr = compute_atr(dates, fut_["SI"], 20);
+        // ATRs for all instruments (needed for risk-parity sizing)
+        std::unordered_map<std::string, std::vector<double>> all_atrs;
+        for (const auto& sym : {"HG", "GC", "CL", "SI", "ZN", "UB", "6J", "MES", "MNQ"}) {
+            all_atrs[sym] = compute_atr(dates, fut_[sym], 20);
+        }
+        auto& gc_atr = all_atrs["GC"];
+        auto& si_atr = all_atrs["SI"];
 
         // Pre-compute returns for correlation
         auto make_ret = [&](const std::vector<double>& px) {
@@ -682,17 +711,18 @@ public:
             entry_prices[s] = std::numeric_limits<double>::quiet_NaN();
         }
 
-        // Point values
+        // Point values: $ per 1.0 price change per contract
+        // Must match data units: HG in $/lb, 6J in $/JPY, etc.
         const std::unordered_map<std::string, double> POINT_VALUE = {
-            {"HG", 250.0},    // 1 cent = $250
-            {"GC", 100.0},    // $1 = $100
-            {"CL", 1000.0},   // $1 = $1000
-            {"SI", 5000.0},   // $1 = $5000
-            {"ZN", 1000.0},   // 1 point = $1000
-            {"UB", 1000.0},   // 1 point = $1000
-            {"6J", 12.50},    // 1 pip = $12.50
-            {"MES", 5.0},     // 1 point = $5
-            {"MNQ", 2.0}      // 1 point = $2
+            {"HG", 25000.0},      // 25,000 lbs/contract, data in $/lb
+            {"GC", 100.0},        // 100 oz/contract, data in $/oz
+            {"CL", 1000.0},       // 1,000 bbl/contract, data in $/bbl
+            {"SI", 5000.0},       // 5,000 oz/contract, data in $/oz
+            {"ZN", 1000.0},       // $1000/point, data in points
+            {"UB", 1000.0},       // $1000/point, data in points
+            {"6J", 12500000.0},   // 12,500,000 JPY/contract, data in $/JPY
+            {"MES", 5.0},         // $5/point, data in index points
+            {"MNQ", 2.0}          // $2/point, data in index points
         };
 
         // Price vectors for easy access
@@ -745,10 +775,11 @@ public:
                 composite = p_.w1 * sign_roc20 + p_.w2 * signal_ma + p_.w3 * signal_z;
             }
 
+            // Spec: "macro_tilt = RISK_ON if composite > threshold else RISK_OFF" (binary)
             MacroTilt raw_tilt = MacroTilt::NEUTRAL;
             if (!std::isnan(composite)) {
                 if (composite > p_.composite_thresh) raw_tilt = MacroTilt::RISK_ON;
-                else if (composite < -p_.composite_thresh) raw_tilt = MacroTilt::RISK_OFF;
+                else raw_tilt = MacroTilt::RISK_OFF;
             }
 
             // Minimum holding period
@@ -794,14 +825,15 @@ public:
             double growth = std::isnan(spx_mom[i]) ? 0.0 : spx_mom[i];
             double inflation = std::isnan(be_chg[i]) ? 0.0 : be_chg[i];
 
-            // EXACT from outline lines 175-179:
-            // Composite liquidity indicator = normalize(
-            //    -1 * VIX_percentile_60d +              # from vix.csv
-            //    -1 * high_yield_spread_zscore +        # from high_yield_spread.csv
-            //    fed_balance_sheet_growth_yoy           # from fed_balance_sheet.csv
-            // )
+            // Regime Classifier liquidity (spec line 152):
+            // liquidity_signal = -1 * (DXY_zscore + credit_spread_zscore + VIX_zscore) / 3
+            double dxy_z = std::isnan(dxy_z60[i]) ? 0.0 : dxy_z60[i];
+            double vix_z = std::isnan(vix_z60[i]) ? 0.0 : vix_z60[i];
+            double hy_zscore = std::isnan(hy_z60[i]) ? 0.0 : hy_z60[i];
+            double regime_liquidity = -1.0 * (dxy_z + hy_zscore + vix_z) / 3.0;
 
-            // Calculate VIX percentile (60-day)
+            // Supplementary liquidity proxy (spec lines 218-227):
+            // normalize(-1*VIX_percentile_60d + -1*HY_spread_zscore + fed_bs_yoy)
             double vix_percentile = 0.0;
             if (i >= 60) {
                 std::vector<double> vix_window;
@@ -816,43 +848,21 @@ public:
                     vix_percentile = static_cast<double>(rank) / vix_window.size();
                 }
             }
-
-            // High yield spread z-score (already computed as hy_z60)
-            double hy_zscore = std::isnan(hy_z60[i]) ? 0.0 : hy_z60[i];
-
-            // Fed balance sheet YoY growth (already computed as fed_bs_yoy)
-
-            // Normalize components (simplified normalization: scale each to approx -3 to +3 range)
-            // Composite liquidity indicator per outline lines 217-222:
-            // normalize(-1*VIX_percentile_60d + -1*HY_spread_zscore + fed_bs_yoy) / 3
-            // All three components z-scored for comparable scale
-            // Doc: normalize the sum of three components, not pre-z-score each
-            // fed_bs_yoy is already a ratio (e.g. 0.15 = 15% YoY growth)
-            // Scale it to be comparable to the other components (approx -3 to +3)
             double fbs_raw       = std::isnan(fed_bs_yoy[i]) ? 0.0 : fed_bs_yoy[i];
             double vix_component = -1.0 * (vix_percentile * 6.0 - 3.0);
             double hy_component  = -1.0 * hy_zscore;
-            double fbs_component = fbs_raw * 10.0;  // scale: 0.3 YoY growth -> +3.0
-            double liquidity = (vix_component + hy_component + fbs_component) / 3.0;
-
-            // DEBUG: Print liquidity values around Nov 2014
-            if (dates[i] >= parse_date("2014-11-01") && dates[i] <= parse_date("2014-12-31")) {
-                std::cout << date_from_int(dates[i])
-                          << " liquidity: " << liquidity
-                          << " vix_comp: " << vix_component
-                          << " hy_comp: " << hy_component
-                          << " fbs_comp: " << fbs_component
-                          << " thresh: " << p_.liquidity_thresh << "\n";
-            }
+            double fbs_component = fbs_raw * 10.0;
+            double supp_liquidity = (vix_component + hy_component + fbs_component) / 3.0;
 
             double rr_val = std::isnan(real_rate[i]) ? 0.0 : real_rate[i];
             double rr_chg_val = std::isnan(rr_chg[i]) ? 0.0 : rr_chg[i];
             double rr_z_val = std::isnan(rr_zscore[i]) ? 0.0 : rr_zscore[i];
 
+            // Regime classification using regime_liquidity (spec lines 161-172)
             Regime regime = Regime::NEUTRAL;
-            if (liquidity < p_.liquidity_thresh) {
+            if (regime_liquidity < p_.liquidity_thresh) {
                 regime = Regime::LIQUIDITY_SHOCK;
-            } else if (inflation > 0.10 && growth < 0.5) {
+            } else if (inflation > 1.0 && growth < 0.5) {
                 regime = Regime::INFLATION_SHOCK;
             } else if (growth > 0.5) {
                 regime = Regime::GROWTH_POSITIVE;
@@ -860,24 +870,11 @@ public:
                 regime = Regime::GROWTH_NEGATIVE;
             }
 
-            // DEBUG: breakeven units check
-            if (i % 252 == 0) {
-                std::cout << "[BE_CHECK] " << date_from_int(dates[i])
-                          << " breakeven=" << breakeven[i]
-                          << " be_chg_20d=" << (std::isnan(be_chg[i]) ? 0.0 : be_chg[i])
-                          << " growth=" << growth
-                          << " inflation_check=" << (inflation > 0.10 && growth < 0.5)
-                          << "\n";
-            }
-
-            // DEBUG: count inflation shock days
             if (regime == Regime::INFLATION_SHOCK) infl_shock_days++;
 
-            // DEBUG: Track regime changes (your existing code, keep it)
+            // Track regime changes
             static Regime last_debug_regime = Regime::NEUTRAL;
-            if (regime != last_debug_regime && dates[i] >= parse_date("2014-11-01")) {
-                last_debug_regime = regime;
-            }
+            last_debug_regime = regime;
 
             // ============================================================
             // Layer 3: DXY Filter
@@ -966,8 +963,10 @@ public:
 
             if (regime == Regime::LIQUIDITY_SHOCK) {
                 size_mult = 0.0;
+            } else if (macro_tilt == MacroTilt::RISK_OFF && regime == Regime::GROWTH_POSITIVE) {
+                size_mult = 0.0;  // spec: "Reduce to neutral"
             } else if (macro_tilt == MacroTilt::RISK_ON && regime == Regime::GROWTH_NEGATIVE) {
-                size_mult = 0.5;
+                size_mult = 0.5;  // spec: "Cautious, reduced size"
             } else if (regime == Regime::NEUTRAL) {
                 size_mult = 0.5;
             } else if (regime == Regime::INFLATION_SHOCK) {
@@ -977,13 +976,15 @@ public:
             if (dxy_filter == DXYFilter::SUSPECT)
                 size_mult *= 0.5;
 
-            if (liquidity < p_.liquidity_thresh)
+            // Supplementary liquidity proxy (spec lines 224-226)
+            if (supp_liquidity < p_.liquidity_thresh)
                 size_mult *= 0.25;
 
             if (corr_spike)
                 size_mult *= 0.5;
 
-            size_mult *= china_adj;
+            // china_adj is applied per-position to HG only (spec: "Reduce Cu-related conviction")
+            // NOT as a global multiplier — that would double-apply to HG
         std::unordered_set<std::string> stopped_out_today;
 
             // ============================================================
@@ -1171,7 +1172,7 @@ public:
                 sig.macro_tilt = macro_tilt;
                 sig.growth_signal = growth;
                 sig.inflation_signal = inflation;
-                sig.liquidity_score = liquidity;
+                sig.liquidity_score = regime_liquidity;
                 sig.real_rate_10y = rr_val;
                 sig.real_rate_chg_20d = rr_chg_val;
                 sig.real_rate_zscore = rr_z_val;
@@ -1226,17 +1227,23 @@ public:
 
                 double boj_factor = boj_int ? 0.5 : 1.0;
 
+                // Silver signal strength: |composite| > 0.5 = strong, else weak
+                bool strong_signal = !std::isnan(composite) && std::abs(composite) > 0.5;
+
                 // TRADE EXPRESSIONS - EXACT from doc
                 if (macro_tilt == MacroTilt::RISK_ON) {
                     if (regime == Regime::INFLATION_SHOCK) {
-                        new_positions["MES"] = 0.0;
-                        new_positions["MNQ"] = 0.0;
+                        // Spec: "Long commodities only, no equity beta"
                         new_positions["HG"]  = contracts_for("HG", 1.0) * china_adj;
                         new_positions["CL"]  = contracts_for("CL", 1.0);
+                        // SI: INFLATION_SHOCK + Any = Long SI (spec line 532)
                         new_positions["SI"]  = std::isnan(si_adj) ? 0.0 : contracts_for("SI", 1.0, si_adj);
-                        new_positions["GC"]  = skip_gold_short ? 0.0 : contracts_for("GC", -1.0);
-                        new_positions["ZN"]  = contracts_for("ZN", -1.0);
-                        new_positions["UB"]  = contracts_for("UB", -1.0);
+                        new_positions["GC"]  = 0.0;
+                        new_positions["MES"] = 0.0;
+                        new_positions["MNQ"] = 0.0;
+                        new_positions["ZN"]  = 0.0;
+                        new_positions["UB"]  = 0.0;
+                        // 6J: RISK_ON + Any = Short 6J (spec line 543)
                         new_positions["6J"]  = contracts_for("6J", -1.0) * boj_factor;
                     } else {
                         new_positions["MES"] = contracts_for("MES", 1.0);
@@ -1244,32 +1251,48 @@ public:
                         new_positions["HG"]  = contracts_for("HG",  1.0) * china_adj;
                         new_positions["CL"]  = contracts_for("CL",  1.0);
                         new_positions["GC"]  = skip_gold_short ? 0.0 : contracts_for("GC", -1.0);
-                        new_positions["SI"]  = std::isnan(si_adj) ? 0.0 : contracts_for("SI",  1.0, si_adj);
+                        // SI: RISK_ON + strong = Long, weak = Skip (spec lines 528-529)
+                        if (strong_signal)
+                            new_positions["SI"] = std::isnan(si_adj) ? 0.0 : contracts_for("SI", 1.0, si_adj);
+                        else
+                            new_positions["SI"] = 0.0;
                         new_positions["ZN"]  = contracts_for("ZN", -1.0);
                         new_positions["UB"]  = contracts_for("UB", -1.0);
                         new_positions["6J"]  = contracts_for("6J", -1.0) * boj_factor;
                     }
                 } else if (macro_tilt == MacroTilt::RISK_OFF) {
                     if (regime == Regime::INFLATION_SHOCK) {
+                        // Spec: "Long gold, short duration"
                         new_positions["GC"]  = contracts_for("GC",  1.0);
                         new_positions["ZN"]  = contracts_for("ZN", -1.0);
                         new_positions["UB"]  = contracts_for("UB", -1.0);
-                        new_positions["MES"] = contracts_for("MES", -0.5);
-                        new_positions["MNQ"] = contracts_for("MNQ", -0.5);
+                        // SI: INFLATION_SHOCK + Any = Long SI (spec line 532)
+                        new_positions["SI"]  = std::isnan(si_adj) ? 0.0 : contracts_for("SI", 1.0, si_adj);
+                        new_positions["MES"] = 0.0;
+                        new_positions["MNQ"] = 0.0;
                         new_positions["HG"]  = 0.0;
                         new_positions["CL"]  = 0.0;
-                        new_positions["SI"]  = std::isnan(si_adj) ? 0.0 : contracts_for("SI",  1.0, si_adj);
+                        // 6J: RISK_OFF + INFLATION_SHOCK = Skip (spec line 548)
                         new_positions["6J"]  = 0.0;
                     } else {
                         new_positions["MES"] = contracts_for("MES", -1.0);
                         new_positions["MNQ"] = contracts_for("MNQ", -1.0);
-                        new_positions["HG"]  = contracts_for("HG",  -1.0);
+                        new_positions["HG"]  = contracts_for("HG",  -1.0) * china_adj;
                         new_positions["CL"]  = contracts_for("CL",  -1.0);
                         new_positions["GC"]  = contracts_for("GC",   1.0);
-                        new_positions["SI"]  = std::isnan(si_adj) ? 0.0 : contracts_for("SI",   1.0, si_adj);
+                        // SI: RISK_OFF + strong = Long, weak = Long reduced (spec lines 530-531)
+                        if (strong_signal)
+                            new_positions["SI"] = std::isnan(si_adj) ? 0.0 : contracts_for("SI", 1.0, si_adj);
+                        else
+                            new_positions["SI"] = std::isnan(si_adj) ? 0.0 : contracts_for("SI", 1.0, si_adj * 0.5);
                         new_positions["ZN"]  = contracts_for("ZN",   1.0);
                         new_positions["UB"]  = contracts_for("UB",   1.0);
-                        new_positions["6J"]  = contracts_for("6J",   1.0) * boj_factor;
+                        // 6J: RISK_OFF + GROWTH_NEGATIVE → Long (spec line 545)
+                        // RISK_OFF + other non-inflation regimes → no 6J position
+                        if (regime == Regime::GROWTH_NEGATIVE)
+                            new_positions["6J"] = contracts_for("6J", 1.0) * boj_factor;
+                        else
+                            new_positions["6J"] = 0.0;
                     }
                 } else {
                     for (const char* s : {"HG","GC","CL","SI","MES","MNQ","ZN","UB","6J"})
@@ -1299,7 +1322,7 @@ public:
                 for (auto& [sym, qty] : new_positions) {
                     auto lit = SINGLE_NOTIONAL_LIMIT.find(sym);
                     if (lit == SINGLE_NOTIONAL_LIMIT.end()) continue;
-                    double max_q = std::floor(equity * lit->second / ContractSpec::get(sym).notional);
+                    double max_q = std::max(0.0, std::floor(equity * lit->second / ContractSpec::get(sym).notional));
                     if (std::abs(qty) > max_q)
                         qty = std::copysign(max_q, qty);
                 }
@@ -1357,24 +1380,26 @@ public:
             } else {
                 // TEST MODE: fixed positions
                 double pos_size = p_.fixed_position_size * size_mult;
+                bool strong_sig = !std::isnan(composite) && std::abs(composite) > 0.5;
 
                 if (macro_tilt == MacroTilt::RISK_ON) {
                     if (regime == Regime::INFLATION_SHOCK) {
-                        new_positions["HG"] = pos_size;
+                        // Spec: "Long commodities only, no equity beta"
+                        new_positions["HG"] = pos_size * china_adj;
                         new_positions["CL"] = pos_size;
-                        new_positions["SI"] = pos_size;
-                        new_positions["GC"] = skip_gold_short ? 0.0 : -pos_size;
-                        new_positions["ZN"] = -pos_size;
-                        new_positions["UB"] = -pos_size;
+                        new_positions["SI"] = pos_size;  // INFLATION_SHOCK = always long SI
+                        new_positions["GC"] = 0.0;
+                        new_positions["ZN"] = 0.0;
+                        new_positions["UB"] = 0.0;
                         new_positions["6J"] = -pos_size * (boj_int ? 0.5 : 1.0);
                         new_positions["MES"] = 0.0;
                         new_positions["MNQ"] = 0.0;
                     } else {
                         new_positions["MES"] = pos_size;
                         new_positions["MNQ"] = pos_size;
-                        new_positions["HG"] = pos_size;
+                        new_positions["HG"] = pos_size * china_adj;
                         new_positions["CL"] = pos_size;
-                        new_positions["SI"] = pos_size;
+                        new_positions["SI"] = strong_sig ? pos_size : 0.0;  // skip on weak
                         new_positions["GC"] = skip_gold_short ? 0.0 : -pos_size;
                         new_positions["ZN"] = -pos_size;
                         new_positions["UB"] = -pos_size;
@@ -1382,25 +1407,30 @@ public:
                     }
                 } else if (macro_tilt == MacroTilt::RISK_OFF) {
                     if (regime == Regime::INFLATION_SHOCK) {
+                        // Spec: "Long gold, short duration"
                         new_positions["GC"] = pos_size;
                         new_positions["ZN"] = -pos_size;
                         new_positions["UB"] = -pos_size;
-                        new_positions["SI"] = pos_size;
-                        new_positions["MES"] = -pos_size * 0.5;
-                        new_positions["MNQ"] = -pos_size * 0.5;
+                        new_positions["SI"] = pos_size;  // INFLATION_SHOCK = always long SI
+                        new_positions["MES"] = 0.0;
+                        new_positions["MNQ"] = 0.0;
                         new_positions["HG"] = 0.0;
                         new_positions["CL"] = 0.0;
-                        new_positions["6J"] = 0.0;
+                        new_positions["6J"] = 0.0;  // INFLATION_SHOCK = skip 6J
                     } else {
                         new_positions["MES"] = -pos_size;
                         new_positions["MNQ"] = -pos_size;
-                        new_positions["HG"] = -pos_size;
+                        new_positions["HG"] = -pos_size * china_adj;
                         new_positions["CL"] = -pos_size;
                         new_positions["GC"] = pos_size;
-                        new_positions["SI"] = pos_size;
+                        new_positions["SI"] = strong_sig ? pos_size : pos_size * 0.5;  // reduced on weak
                         new_positions["ZN"] = pos_size;
                         new_positions["UB"] = pos_size;
-                        new_positions["6J"] = pos_size * (boj_int ? 0.5 : 1.0);
+                        // 6J: only long in GROWTH_NEGATIVE (spec line 545)
+                        if (regime == Regime::GROWTH_NEGATIVE)
+                            new_positions["6J"] = pos_size * (boj_int ? 0.5 : 1.0);
+                        else
+                            new_positions["6J"] = 0.0;
                     }
                 }
             }
@@ -1473,7 +1503,7 @@ public:
 
             sig.growth_signal = growth;
             sig.inflation_signal = inflation;
-            sig.liquidity_score = liquidity;
+            sig.liquidity_score = regime_liquidity;
             sig.real_rate_10y = rr_val;
             sig.real_rate_chg_20d = rr_chg_val;
             sig.real_rate_zscore = rr_z_val;
@@ -1653,10 +1683,8 @@ public:
                 std::cout << "  INFLATION_SHOCK days: " << infl_shock_days
                           << " out of " << n_signals << " total"
                           << " (" << (100.0 * infl_shock_days / n_signals) << "%)\n";
-                std::cout << "  If breakeven is in % units (e.g. 2.5 = 2.5%):\n";
-                std::cout << "    threshold 0.10 = 10bp change over 20d (fires easily)\n";
-                std::cout << "    threshold 1.00 = 100bp change over 20d (spec intent)\n";
-                std::cout << "  Expected: ~2-5% of days. If much higher, threshold is wrong.\n";
+                std::cout << "  Threshold: inflation > 1.0 (100bp breakeven change over 20d)\n";
+                std::cout << "  Expected: ~2-5% of days.\n";
 
                 std::cout << "\n══════════════════════════════════════════════════════════════\n";
             }
